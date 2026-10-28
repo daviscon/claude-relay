@@ -203,11 +203,27 @@ def capture_setup_token():
     except OSError as e:
         print(f"relay: couldn't run claude setup-token ({e})", file=sys.stderr)
         return None
-    text = ANSI_RE.sub("", buf.decode("utf-8", "replace"))
-    # The TUI may wrap the token across lines; glue lines that continue it.
-    joined = re.sub(r"[\r\n]+\s*", "", text)
-    found = TOKEN_RE.findall(joined) or TOKEN_RE.findall(text)
-    return found[-1] if found else None
+    return token_from_output(ANSI_RE.sub("", buf.decode("utf-8", "replace")))
+
+
+def token_from_output(text):
+    """The token as `claude setup-token` printed it. The TUI wraps it to the
+    terminal width, so the following lines that are nothing but token
+    characters belong to it; the first line with anything else ends it."""
+    lines = [l.strip() for l in re.split(r"\r\n|\r|\n", text)]
+    starts = [i for i, l in enumerate(lines) if "sk-ant-oat01-" in l]
+    if not starts:
+        return None
+    i = starts[-1]
+    token = re.search(r"sk-ant-oat01-[A-Za-z0-9_\-]*", lines[i]).group(0)
+    prev = lines[i]
+    for line in lines[i + 1:]:
+        # Only a full-width line wraps onto the next one.
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", line) or len(prev) < 40 or len(line) > len(prev):
+            break
+        token += line
+        prev = line
+    return token if TOKEN_RE.fullmatch(token) else None
 
 
 # ── usage probing ──────────────────────────────────────────────────────────
