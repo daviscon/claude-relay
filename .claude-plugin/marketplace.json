@@ -1,0 +1,14 @@
+{
+  "name": "claude-relay",
+  "description": "relay: one Claude Code conversation across all your Claude accounts.",
+  "owner": {
+    "name": "Connor Davis"
+  },
+  "plugins": [
+    {
+      "name": "relay",
+      "source": "./",
+      "description": "One Claude Code conversation across all your Claude accounts: live usage beside the chat, a one-click hand-off when an account runs out, and side tasks that run as copies of the chat on your other accounts."
+    }
+  ]
+}

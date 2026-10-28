@@ -5,27 +5,28 @@ description: Spread work across the user's other Claude accounts with the `relay
 
 # relay: other Claude accounts as workers
 
-`relay` is installed on this machine. The user has logged several Claude accounts into it. Each worker you start with `relay delegate` is a **fork of this conversation** running on another account: it already knows everything said here, and it bills that other account, not this one.
+`relay` is installed on this machine. The user has logged several Claude accounts into it. Each worker you start is a **fork of this conversation** running on another account: it already knows everything said here, and it bills that other account, not this one.
 
-## Check headroom
+## With the relay plugin: use its tools
+
+When the tools `mcp__relay__delegate` and `mcp__relay__accounts` are available, use them, not the shell:
+
+- `mcp__relay__accounts`: usage on every account, which one this chat runs on, which goes next.
+- `mcp__relay__delegate` with `tasks` (one string per worker, up to 6), and optionally `account` (all tasks there; left out, they spread over the accounts with the most room), `wait` (default true: you get the reports back; false: carry on and each report arrives in the chat later) and `fresh` (no conversation context, cheaper).
+
+"Delegate this to work" means `account: "work"` (whatever the user named that account). "Split these across my accounts" means several tasks and no `account`. Jobs you start show up in the user's Relay panel.
+
+## Without the plugin: the `relay` command
 
 ```bash
 relay status
-```
-
-Shows the 5-hour and weekly usage of every account and marks the one that goes next. Run it before a big delegation, or when the user asks what's left.
-
-## Delegate
-
-```bash
 relay delegate "task one" "task two" "task three"
 ```
 
-- Each quoted task becomes its own worker. Workers run in parallel, spread across the accounts with the most usage left. The account running this chat is used last.
-- By default every worker forks this conversation. Add `--fresh` for a worker that needs no context; it's cheaper, because it doesn't re-read the chat.
-- Workers can take minutes. Run the command in the background (or with a long timeout) and keep going; read the output when it finishes.
+- Each quoted task becomes its own worker, spread across the accounts with the most usage left; the account running this chat is used last. `--as <account>` puts them all on one.
+- By default every worker forks this conversation. Add `--fresh` for a worker that needs no context.
+- Workers can take minutes. Run the command in the background (or with a long timeout) and keep going.
 - Workers use the user's normal permission mode. If a task needs shell commands, pass extra claude flags after `--`, e.g. `-- --allowedTools "Bash(ffmpeg *)"`, or `--permission-mode auto`.
-- Each worker ends with a report and a `relay resume <id>` line the user can use to continue that worker's chat.
 
 ## Write good tasks
 

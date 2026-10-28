@@ -1,0 +1,9 @@
+{
+  "name": "relay",
+  "version": "0.3.0",
+  "description": "One Claude Code conversation across all your Claude accounts: live usage beside the chat, a one-click hand-off when an account runs out, and side tasks that run as copies of the chat on your other accounts.",
+  "author": { "name": "Connor Davis" },
+  "homepage": "https://github.com/daviscon/claude-relay",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

@@ -28,14 +28,24 @@ Nothing is copied or summarised, and nothing is lost.
 
 ## Install
 
-Needs macOS or Linux, Python 3 and [Claude Code](https://claude.com/claude-code).
+Needs macOS (Linux works for everything except the buttons that open Terminal), Python 3 and [Claude Code](https://claude.com/claude-code).
+
+**As a Claude Code plugin** (gives you the panel, the slash commands and the `/relay` skill). At the prompt of a terminal session:
+
+```
+/plugin install relay --marketplace daviscon/claude-relay
+```
+
+Answer `y` to add the marketplace, then pick a scope (user is the usual one). From a shell, it's `claude plugin install relay --marketplace daviscon/claude-relay`. In the desktop app, where `/plugin` doesn't run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `daviscon/claude-relay`, then **Add plugin**.
+
+**The `relay` terminal command** (for `relay`, `relay resume` and the rest below):
 
 ```bash
 git clone https://github.com/daviscon/claude-relay.git
 cd claude-relay && ./install.sh
 ```
 
-Then add your accounts:
+Then add your accounts, either with `/relay-add <name>` inside Claude or in a terminal:
 
 ```bash
 relay add main --login   # whatever `claude` is already logged into
@@ -45,6 +55,37 @@ relay status
 ```
 
 `relay add` runs Claude Code's own `claude setup-token` login, which gives you a token that lasts a year. Before running it, switch claude.ai in your browser to the account you want for that slot.
+
+## The panel
+
+Type `/relay-panel` and relay docks beside your chat, in the desktop app and in a fullscreen terminal:
+
+- every account's 5-hour and weekly usage, with the one this chat runs on and the one that goes next marked;
+- **when this chat hits its limit**, the panel opens by itself and offers **Continue this chat on _second_**. One click reopens this exact conversation in Terminal on that account;
+- **Side task**: type a task and a copy of this chat does it on your other account, then hands its report back into this conversation, the way a subagent's result comes back.
+
+### Just ask Claude
+
+With the plugin installed, Claude has a `delegate` tool. Say it the way you'd say it to a person:
+
+- "Delegate the B-roll search to my second account."
+- "Split these three renders across my accounts."
+- "Send that research to my other account and keep going here."
+
+Each job runs as a copy of this chat on the other account and shows up in the panel. Claude either waits for the reports or carries on and gets them when they land.
+
+**Auto-delegate** (off by default; turn it on with the panel's switch or `/relay-auto on`): once this chat's account passes 90% of its 5-hour or weekly usage, Claude starts sending big, independent jobs to the account with the most room by itself, and tells you when it does. Small steps and decisions stay in your chat.
+
+A Claude Code mod can't change which account a running chat uses, so the hand-off opens Terminal instead of switching in place. The desktop chat stays where it was; carry on in Terminal.
+
+| slash command | does |
+|---|---|
+| `/relay-panel` | open the panel |
+| `/relay-status` | usage on every account, as text |
+| `/relay-swap [account]` | continue this chat in Terminal on another account |
+| `/relay-delegate <task>` | run a side task as a copy of this chat on your other account |
+| `/relay-add <name> [--login]` | log in another account (opens Terminal) |
+| `/relay-auto [on\|off]` | let Claude delegate big jobs by itself near the limit |
 
 ## Use it
 
@@ -128,6 +169,7 @@ relay delegate --permission-mode auto "…"
 ```bash
 for a in $(relay list | awk '{print $1}'); do relay rm "$a"; done
 rm ~/.local/bin/relay ~/.claude/skills/relay/SKILL.md
+claude plugin uninstall relay   # if you installed the plugin
 rm -rf ~/.claude-relay
 ```
 

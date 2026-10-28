@@ -172,7 +172,9 @@ def token_delete(name):
 
 def child_env(acct):
     """Environment for a `claude` child that bills `acct`."""
-    inside = "CLAUDECODE" in os.environ
+    # Run by Claude Code (its Bash tool, or the relay mod inside the desktop
+    # app): the session's own variables are its business, not the child's.
+    inside = any(k in os.environ for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"))
     env = {k: v for k, v in os.environ.items()
            if k in KEEP_ENV or not (inside and SESSION_ENV.match(k))}
     # An API key would win over the subscription token, so it never passes.
@@ -791,7 +793,7 @@ def cmd_delegate(a):
 
 
 def cmd_install_skill(a):
-    src = Path(SELF).parent / "skill" / "SKILL.md"
+    src = Path(SELF).parent / "skills" / "relay" / "SKILL.md"
     if not src.exists():
         die(f"can't find {src}")
     dst = CLAUDE_DIR / "skills" / "relay" / "SKILL.md"
