@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""relay: run one Claude Code conversation across several Claude accounts.
+
+Every Claude Code conversation is a transcript on your disk
+(~/.claude/projects/<project>/<session>.jsonl). The account only decides who
+pays for the next message. So relay keeps a login token per account and
+launches `claude` with whichever account has the most usage left. When an
+account runs dry mid-conversation, relay resumes the same transcript on the
+next account and tells Claude to carry on. Nothing is copied, nothing is lost.
+
+    relay add <name>            log in an account (runs `claude setup-token`)
+    relay add <name> --login    use whatever `claude` is already logged into
+    relay status                usage left on every account
+    relay                       start Claude on the account with most headroom
+    relay resume [session]      continue an existing chat on another account
+    relay swap [account]        move the running chat to another account now
+    relay delegate "task" ...   fork this chat onto other accounts as workers
+
+Standard library only. macOS stores tokens in the Keychain; elsewhere they
+live in ~/.claude-relay/tokens with 0600 permissions.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+VERSION = "0.1.0"
+HOME = Path(os.environ.get("RELAY_HOME", Path.home() / ".claude-relay"))
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+KEYCHAIN_SERVICE = os.environ.get("RELAY_KEYCHAIN_SERVICE", "claude-relay")
+CLAUDE = os.environ.get("RELAY_CLAUDE_BIN") or shutil.which("claude") or "claude"
+SELF = str(Path(__file__).resolve())
+
+STATUS_TTL = 120        # seconds a usage reading stays fresh enough to pick from
+MIN_HEADROOM = 0.02     # an account under 2% left counts as empty
+TOKEN_RE = re.compile(r"sk-ant-oat01-[A-Za-z0-9_\-]{40,}")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
+
+CONTINUE_LIMIT = (
+    "[relay] Account \"{old}\" hit its usage limit, so this same conversation "
+    "now runs on account \"{new}\". Nothing was lost. Carry on exactly where you "
+    "left off; if you were mid-step, redo that step."
+)
+CONTINUE_MANUAL = (
+    "[relay] This conversation moved to account \"{new}\". Carry on exactly "
+    "where you left off; if you were mid-step, redo that step."
+)
+WORKER_PROMPT = (
+    "You are a relay worker: a fork of the main conversation, running on a "
+    "different Claude account to share the load. The main session keeps going "
+    "separately, so do only the task in the latest message, don't redo work "
+    "the main session already finished, and don't touch files outside that "
+    "task. End with a short report: what you did, the full paths of files you "
+    "made or changed, and anything left undone."
+)
+
+# Variables a Claude Code session sets for its own children. When relay runs
+# inside a session (e.g. Claude calling `relay delegate`), passing them on
+# would make the worker think it is a subprocess of the parent.
+SESSION_ENV = re.compile(r"^(CLAUDECODE|CLAUDE_CODE_.*|CLAUDE_AGENT_SDK.*|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_PREVIEW.*)$")
+KEEP_ENV = set(filter(None, os.environ.get("RELAY_KEEP_ENV", "").split(",")))
+
+
+# ── small helpers ──────────────────────────────────────────────────────────
+
+def die(msg, code=1):
+    print(f"relay: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def say(msg):
+    # Banner lines go to stderr so `relay ... | something` stays clean.
+    tty = sys.stderr.isatty()
+    print(f"\033[38;5;75m▸ relay\033[0m {msg}" if tty else f"relay: {msg}", file=sys.stderr)
+
+
+def load_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def until(ts):
+    """'in 2h 10m' for a unix timestamp."""
+    if not ts:
+        return ""
+    s = int(ts - time.time())
+    if s <= 0:
+        return "now"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"in {d}d {h}h"
+    if h:
+        return f"in {h}h {m}m"
+    return f"in {m}m"
+
+
+# ── accounts and tokens ────────────────────────────────────────────────────
+
+def accounts():
+    return load_json(HOME / "accounts.json", {"accounts": []})["accounts"]
+
+
+def save_accounts(items):
+    save_json(HOME / "accounts.json", {"accounts": items})
+
+
+def account(name):
+    for a in accounts():
+        if a["name"] == name:
+            return a
+    die(f'no account called "{name}". `relay list` shows them.')
+
+
+def token_get(name):
+    if sys.platform == "darwin":
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name, "-w"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    p = HOME / "tokens" / name
+    return p.read_text().strip() if p.exists() else None
+
+
+def token_set(name, token):
+    if sys.platform == "darwin":
+        # `security -i` reads the command from stdin, which keeps the token
+        # out of the process list.
+        cmd = f"add-generic-password -U -s {shlex.quote(KEYCHAIN_SERVICE)} -a {shlex.quote(name)} -w {shlex.quote(token)}\n"
+        r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
+        if r.returncode == 0 and not r.stderr.strip():
+            return
+        print(f"relay: keychain refused ({r.stderr.strip()}), using a file instead", file=sys.stderr)
+    d = HOME / "tokens"
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    p = d / name
+    p.write_text(token)
+    os.chmod(p, 0o600)
+
+
+def token_delete(name):
+    if sys.platform == "darwin":
+        subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name],
+                       capture_output=True)
+    (HOME / "tokens" / name).unlink(missing_ok=True)
+
+
+def child_env(acct):
+    """Environment for a `claude` child that bills `acct`."""
+    inside = "CLAUDECODE" in os.environ
+    env = {k: v for k, v in os.environ.items()
+           if k in KEEP_ENV or not (inside and SESSION_ENV.match(k))}
+    # An API key would win over the subscription token, so it never passes.
+    for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        env.pop(k, None)
+    if acct.get("kind") != "login":
+        tok = token_get(acct["name"])
+        if not tok:
+            die(f'no token stored for "{acct["name"]}". Run `relay add {acct["name"]}` again.')
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    env["RELAY_ACCOUNT"] = acct["name"]
+    return env
+
+
+def capture_setup_token():
+    """Run `claude setup-token` on a pty so the user sees the normal login
+    flow, and fish the token out of what it prints."""
+    import pty
+    buf = bytearray()
+
+    def read(fd):
+        data = os.read(fd, 4096)
+        buf.extend(data)
+        return data
+
+    try:
+        pty.spawn([CLAUDE, "setup-token"], read)
+    except OSError as e:
+        print(f"relay: couldn't run claude setup-token ({e})", file=sys.stderr)
+        return None
+    text = ANSI_RE.sub("", buf.decode("utf-8", "replace"))
+    # The TUI may wrap the token across lines; glue lines that continue it.
+    joined = re.sub(r"[\r\n]+\s*", "", text)
+    found = TOKEN_RE.findall(joined) or TOKEN_RE.findall(text)
+    return found[-1] if found else None
+
+
+# ── usage probing ──────────────────────────────────────────────────────────
+
+def probe(acct):
+    """Ask Claude Code itself for the account's usage. One tiny Haiku turn
+    (well under a cent); its stream carries a rate_limit_event with the 5-hour
+    and weekly windows."""
+    out = {"name": acct["name"], "checked": time.time(), "ok": False}
+    cmd = [CLAUDE, "-p", "ok", "--model", "haiku", "--output-format", "stream-json", "--verbose",
+           "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence", "--tools", ""]
+    try:
+        r = subprocess.run(cmd, env=child_env(acct), cwd=str(HOME), capture_output=True, text=True,
+                           timeout=90, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        out["error"] = "timed out"
+        return out
+    text = ""
+    for line in r.stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "rate_limit_event":
+            info = ev.get("rate_limit_info", {})
+            out["status"] = info.get("status")
+            for key, w in (info.get("unifiedWindows") or {}).items():
+                out[key] = {"used": w.get("utilization"), "resets": w.get("resetsAt"), "status": w.get("status")}
+            out["ok"] = True
+        elif ev.get("type") == "result":
+            text = str(ev.get("result") or "")
+            if ev.get("is_error"):
+                out["error"] = text[:200]
+    if not out["ok"] and not out.get("error"):
+        out["error"] = (r.stderr.strip() or text or f"claude exited {r.returncode}")[:200]
+    if out.get("error") and re.search(r"limit|usage|429", out["error"], re.I) and not out.get("status"):
+        out["status"] = "rejected"
+    return out
+
+
+def headroom(st):
+    """Fraction of usage left in the tighter window; -1 when blocked."""
+    if not st or st.get("status") == "rejected":
+        return -1.0
+    if not st.get("ok"):
+        return -1.0
+    used = [w["used"] for w in (st.get("five_hour"), st.get("seven_day")) if w and w.get("used") is not None]
+    if any(w and w.get("status") == "rejected" for w in (st.get("five_hour"), st.get("seven_day"))):
+        return -1.0
+    return 1.0 - max(used) if used else 0.5
+
+
+def statuses(max_age=STATUS_TTL, only=None):
+    """Usage for every account, probing (in parallel) any reading older than max_age."""
+    cache = load_json(HOME / "status.json", {})
+    accts = [a for a in accounts() if only is None or a["name"] in only]
+    stale = [a for a in accts if time.time() - cache.get(a["name"], {}).get("checked", 0) > max_age]
+    if stale:
+        with ThreadPoolExecutor(max_workers=len(stale)) as pool:
+            for st in pool.map(probe, stale):
+                cache[st["name"]] = st
+        save_json(HOME / "status.json", cache)
+    return {a["name"]: cache.get(a["name"]) for a in accts}
+
+
+def ranked(sts, exclude=()):
+    """Account names with room left, most headroom first."""
+    names = [n for n, st in sts.items() if n not in exclude and headroom(st) > MIN_HEADROOM]
+    return sorted(names, key=lambda n: headroom(sts[n]), reverse=True)
+
+
+def pick(exclude=(), max_age=STATUS_TTL):
+    if not accounts():
+        die("no accounts yet. Add one with `relay add <name>`.")
+    sts = statuses(max_age)
+    order = ranked(sts, exclude)
+    return (order[0] if order else None), sts
+
+
+def describe(st):
+    if not st:
+        return "unknown"
+    if not st.get("ok"):
+        return st.get("error") or "unreachable"
+    bits = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        w = st.get(key)
+        if w and w.get("used") is not None:
+            bits.append(f"{label} {round(w['used'] * 100)}%")
+    return ", ".join(bits) + " used"
+
+
+def soonest_reset(sts):
+    times = []
+    for st in sts.values():
+        for key in ("five_hour", "seven_day"):
+            w = (st or {}).get(key) or {}
+            if w.get("status") == "rejected" or (w.get("used") or 0) >= 0.98:
+                if w.get("resets"):
+                    times.append(w["resets"])
+    return min(times) if times else None
+
+
+# ── sessions on disk ───────────────────────────────────────────────────────
+
+def session_files():
+    return [p for p in (CLAUDE_DIR / "projects").glob("*/*.jsonl")]
+
+
+def find_session(sid):
+    hits = list((CLAUDE_DIR / "projects").glob(f"*/{sid}.jsonl"))
+    if not hits:
+        # allow a unique prefix
+        hits = [p for p in session_files() if p.stem.startswith(sid)]
+    if len(hits) > 1:
+        die(f'"{sid}" matches {len(hits)} sessions; give more of the id.')
+    return hits[0] if hits else None
+
+
+def session_meta(path):
+    meta = {"id": path.stem, "path": str(path), "mtime": path.stat().st_mtime,
+            "cwd": None, "title": None, "last_prompt": None}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if meta["cwd"] is None and '"cwd"' in line:
+                    try:
+                        meta["cwd"] = json.loads(line).get("cwd")
+                    except ValueError:
+                        pass
+                if '"custom-title"' in line or '"last-prompt"' in line or '"summary"' in line:
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if d.get("type") == "custom-title":
+                        meta["title"] = d.get("customTitle")
+                    elif d.get("type") == "summary" and not meta["title"]:
+                        meta["title"] = d.get("summary")
+                    elif d.get("type") == "last-prompt":
+                        meta["last_prompt"] = d.get("lastPrompt")
+    except OSError:
+        pass
+    return meta
+
+
+def recent_sessions(n=10):
+    files = sorted(session_files(), key=lambda p: p.stat().st_mtime, reverse=True)[:n]
+    return [session_meta(p) for p in files]
+
+
+def ago(ts):
+    s = int(time.time() - ts)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return f"{s // size}{unit} ago"
+    return "just now"
+
+
+# ── interactive runs with automatic hand-off ───────────────────────────────
+
+class Runner:
+    """Runs interactive `claude` and moves the conversation to another
+    account when the current one hits its limit (StopFailure hook) or when
+    `relay swap` asks."""
+
+    def __init__(self, acct_name, args, cwd=None):
+        self.acct = acct_name
+        self.args = list(args)
+        self.cwd = cwd or os.getcwd()
+        self.child = None
+        self.request_file = HOME / "run" / f"{os.getpid()}.json"
+        self.session_file = HOME / "run" / f"{os.getpid()}.session"
+        self.lock_file = HOME / "run" / f"{os.getpid()}.pid"
+
+    def settings(self):
+        # SessionStart tells us which transcript the child is on, including
+        # after /clear or /resume inside it. StopFailure fires on the limit.
+        hook = [{"type": "command", "command": f"{shlex.quote(sys.executable)} {shlex.quote(SELF)} _hook"}]
+        return json.dumps({"hooks": {
+            "SessionStart": [{"hooks": hook}],
+            "StopFailure": [{"matcher": "rate_limit", "hooks": hook}]}})
+
+    def session_from_args(self):
+        for flag in ("--resume", "-r", "--session-id"):
+            if flag in self.args:
+                i = self.args.index(flag)
+                if i + 1 < len(self.args) and not self.args[i + 1].startswith("-"):
+                    return self.args[i + 1]
+        return None
+
+    def on_signal(self, *_):
+        # The hook or `relay swap` wrote a request; decide off the signal
+        # handler so a usage check can't block it.
+        threading.Thread(target=self.consider, daemon=True).start()
+
+    def consider(self):
+        req = load_json(self.request_file, None)
+        if not req:
+            return
+        if req.get("reason") == "rate_limit" and not os.environ.get("RELAY_TRUST_HOOK"):
+            # A 429 can be a blip; only move if the account really is empty.
+            st = statuses(max_age=0, only=[self.acct]).get(self.acct)
+            if headroom(st) > MIN_HEADROOM:
+                self.request_file.unlink(missing_ok=True)
+                return
+        self.stop_child()
+
+    def stop_child(self):
+        p = self.child
+        if not p or p.poll() is not None:
+            return
+        p.terminate()
+        try:
+            p.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+    def run(self):
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_file.write_text(json.dumps({"pid": os.getpid(), "cwd": self.cwd}))
+        signal.signal(signal.SIGUSR1, self.on_signal)
+        # A Python-level handler (not SIG_IGN) so the child still gets Ctrl-C
+        # normally while this wrapper survives it.
+        signal.signal(signal.SIGINT, lambda *_: None)
+        try:
+            return self._loop()
+        finally:
+            self.lock_file.unlink(missing_ok=True)
+            self.request_file.unlink(missing_ok=True)
+            self.session_file.unlink(missing_ok=True)
+
+    def _loop(self):
+        while True:
+            acct = account(self.acct)
+            env = child_env(acct)
+            env["RELAY_PARENT"] = str(os.getpid())
+            # Write each message to the transcript as it happens, so the
+            # transcript is complete whenever we stop this child to move it.
+            env["CLAUDE_CODE_EAGER_FLUSH"] = "1"
+            st = load_json(HOME / "status.json", {}).get(self.acct)
+            say(f'account "{self.acct}" ({describe(st)})')
+            self.request_file.unlink(missing_ok=True)
+            self.child = subprocess.Popen([CLAUDE, "--settings", self.settings(), *self.args],
+                                          env=env, cwd=self.cwd)
+            code = self.child.wait()
+            if sys.stdin.isatty():
+                subprocess.run(["stty", "sane"], stderr=subprocess.DEVNULL)
+            req = load_json(self.request_file, None)
+            if not req:
+                return code
+            tracked = load_json(self.session_file, {}).get("session_id")
+            sid = req.get("session_id") or tracked or self.session_from_args()
+            if not sid:
+                say("couldn't tell which conversation to move; stopping here.")
+                return code
+            if not find_session(sid):
+                # Claude only writes a transcript once the first message lands.
+                say("this chat has no saved messages yet, so there's nothing to move.")
+                return code
+            old = self.acct
+            target = req.get("target")
+            if target:
+                account(target)
+            else:
+                say(f'"{old}" is out of usage, checking the others…')
+                target, sts = pick(exclude={old}, max_age=30)
+                if not target:
+                    reset = soonest_reset(sts)
+                    say("every account is out of usage" + (f"; the first frees up {until(reset)}." if reset else "."))
+                    say(f"pick it up later with: relay resume {sid}")
+                    return 1
+            self.acct = target
+            note = (CONTINUE_LIMIT if req.get("reason") == "rate_limit" else CONTINUE_MANUAL).format(old=old, new=target)
+            say(f'moving this conversation from "{old}" to "{target}"')
+            self.args = ["--resume", sid, note]
+
+
+def hook_main():
+    """SessionStart / StopFailure hook, run by claude inside a relay session."""
+    parent = os.environ.get("RELAY_PARENT")
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    if not parent:
+        return 0
+    if data.get("hook_event_name") == "SessionStart":
+        if data.get("session_id"):
+            save_json(HOME / "run" / f"{parent}.session", {"session_id": data["session_id"]})
+        return 0
+    if data.get("error") != "rate_limit":
+        return 0
+    save_json(HOME / "run" / f"{parent}.json", {
+        "reason": "rate_limit", "session_id": data.get("session_id"),
+        "details": data.get("error_details"), "at": time.time()})
+    try:
+        os.kill(int(parent), signal.SIGUSR1)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+# ── commands ───────────────────────────────────────────────────────────────
+
+def cmd_add(a):
+    items = [x for x in accounts() if x["name"] != a.name]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", a.name):
+        die("account names can use letters, numbers, dot, dash and underscore.")
+    if a.login:
+        entry = {"name": a.name, "kind": "login"}
+    else:
+        if a.token_stdin:
+            tok = sys.stdin.read().strip()
+        else:
+            print(f'Logging in "{a.name}". A browser opens: sign in to the Claude account you want')
+            print("for this slot (switch accounts in the browser first if needed).\n")
+            tok = capture_setup_token()
+            if tok:
+                print(f"\nrelay: got the token ({tok[:16]}…).")
+            else:
+                tok = input("\nPaste the token it printed (starts with sk-ant-oat01-): ").strip()
+        if not TOKEN_RE.fullmatch(tok or ""):
+            die("that doesn't look like a Claude Code token (sk-ant-oat01-…).")
+        token_set(a.name, tok)
+        entry = {"name": a.name, "kind": "token"}
+    entry["added"] = dt.datetime.now().isoformat(timespec="seconds")
+    save_accounts(items + [entry])
+    st = statuses(max_age=0, only=[a.name])[a.name]
+    if not st.get("ok") and st.get("status") != "rejected":
+        print(f'relay: saved "{a.name}" but it didn\'t answer: {st.get("error")}', file=sys.stderr)
+        return 1
+    print(f'relay: added "{a.name}" ({describe(st)})')
+
+
+def cmd_rm(a):
+    items = accounts()
+    if not any(x["name"] == a.name for x in items):
+        die(f'no account called "{a.name}".')
+    save_accounts([x for x in items if x["name"] != a.name])
+    token_delete(a.name)
+    cache = load_json(HOME / "status.json", {})
+    cache.pop(a.name, None)
+    save_json(HOME / "status.json", cache)
+    print(f'relay: removed "{a.name}"')
+
+
+def cmd_list(a):
+    items = accounts()
+    if not items:
+        print("No accounts yet. Add one with `relay add <name>`.")
+    for x in items:
+        kind = "uses claude's own login" if x.get("kind") == "login" else "token"
+        print(f"{x['name']:<14} {kind}")
+
+
+def bar(frac, width=10):
+    frac = max(0.0, min(1.0, frac or 0))
+    full = round(frac * width)
+    return "█" * full + "░" * (width - full)
+
+
+def cmd_status(a):
+    sts = statuses(max_age=0 if a.refresh else 20)
+    if a.json:
+        print(json.dumps(sts, indent=2))
+        return
+    if not sts:
+        print("No accounts yet. Add one with `relay add <name>`.")
+        return
+    best = ranked(sts)
+    color = sys.stdout.isatty()
+    print(f"{'account':<14} {'5-hour':<18} {'weekly':<18} note")
+    for name, st in sts.items():
+        row = f"{name:<14} "
+        if not st or not st.get("ok"):
+            note = "out of usage" if st and st.get("status") == "rejected" else (st or {}).get("error", "unknown")
+            print(row + f"{'—':<18} {'—':<18} {note}")
+            continue
+        cells = []
+        for key in ("five_hour", "seven_day"):
+            w = st.get(key) or {}
+            u = w.get("used")
+            cells.append(f"{bar(u)} {round((u or 0) * 100):>3}%" if u is not None else "—")
+        notes = []
+        for key, label in (("five_hour", "5h"), ("seven_day", "week")):
+            w = st.get(key) or {}
+            if w.get("status") == "rejected" or (w.get("used") or 0) >= 0.98:
+                notes.append(f"{label} resets {until(w.get('resets'))}")
+        if best and name == best[0]:
+            notes.insert(0, "← next up")
+        line = row + f"{cells[0]:<18} {cells[1]:<18} {'  '.join(notes)}"
+        if color and best and name == best[0]:
+            line = f"\033[1m{line}\033[0m"
+        print(line)
+
+
+def cmd_pick(a):
+    name, _ = pick()
+    if not name:
+        die("every account is out of usage.")
+    print(name)
+
+
+def cmd_sessions(a):
+    for i, s in enumerate(recent_sessions(a.n), 1):
+        title = s["title"] or (s["last_prompt"] or "").replace("\n", " ")[:60] or "(untitled)"
+        where = Path(s["cwd"]).name if s["cwd"] else "?"
+        print(f"{i:>2}. {title[:60]:<60}  {where:<18} {ago(s['mtime']):>8}  {s['id'][:8]}")
+
+
+def choose_session():
+    items = recent_sessions(10)
+    if not items:
+        die("no Claude Code sessions found on this machine.")
+    for i, s in enumerate(items, 1):
+        title = s["title"] or (s["last_prompt"] or "").replace("\n", " ")[:60] or "(untitled)"
+        where = Path(s["cwd"]).name if s["cwd"] else "?"
+        print(f"{i:>2}. {title[:60]:<60}  {where:<18} {ago(s['mtime'])}")
+    ans = input("\nWhich conversation? [1] ").strip() or "1"
+    if not ans.isdigit() or not 1 <= int(ans) <= len(items):
+        die("no such number.")
+    return items[int(ans) - 1]
+
+
+def start_account(requested, exclude=()):
+    if requested:
+        account(requested)
+        statuses(max_age=STATUS_TTL, only=[requested])
+        return requested
+    name, sts = pick(exclude=exclude)
+    if not name:
+        reset = soonest_reset(sts)
+        die("every account is out of usage" + (f"; the first frees up {until(reset)}." if reset else "."))
+    return name
+
+
+def cmd_resume(a):
+    if a.last:
+        meta = recent_sessions(1)[0]
+    elif a.session:
+        path = find_session(a.session)
+        if not path:
+            die(f'no session "{a.session}". `relay sessions` lists recent ones.')
+        meta = session_meta(path)
+    else:
+        meta = choose_session()
+    cwd = meta["cwd"] if meta["cwd"] and os.path.isdir(meta["cwd"]) else os.getcwd()
+    if time.time() - meta["mtime"] < 60:
+        say("this chat changed in the last minute. If it's still open somewhere else, "
+            "don't type in both at once.")
+    name = start_account(a.account)
+    args = ["--resume", meta["id"]]
+    if a.prompt:
+        args.append(a.prompt)
+    return Runner(name, args, cwd).run()
+
+
+def cmd_swap(a):
+    parent = os.environ.get("RELAY_PARENT")
+    if not parent:
+        live = []
+        for p in (HOME / "run").glob("*.pid"):
+            try:
+                os.kill(int(p.stem), 0)
+                live.append(p.stem)
+            except (OSError, ValueError):
+                p.unlink(missing_ok=True)
+        if len(live) != 1:
+            die("run this inside a relay session (type `! relay swap` in Claude), "
+                "or with exactly one relay session open." if not live else
+                f"{len(live)} relay sessions are open; run `! relay swap` inside the one to move.")
+        parent = live[0]
+    if a.account:
+        account(a.account)
+        if a.account == os.environ.get("RELAY_ACCOUNT"):
+            die(f'already on "{a.account}".')
+        target = a.account
+    else:
+        target, sts = pick(exclude={os.environ.get("RELAY_ACCOUNT")})
+        if not target:
+            die("no other account has usage left.")
+    # No session id here: the wrapper tracks its own child's session, and the
+    # caller's CLAUDE_CODE_SESSION_ID may belong to a different chat entirely.
+    save_json(HOME / "run" / f"{parent}.json", {"reason": "manual", "target": target, "at": time.time()})
+    os.kill(int(parent), signal.SIGUSR1)
+    print(f'relay: moving to "{target}". Claude restarts in a moment with the same conversation.')
+
+
+def run_worker(task, acct, fork, cwd, a):
+    cmd = [CLAUDE, "-p", task, "--output-format", "json", "--append-system-prompt", WORKER_PROMPT]
+    if fork:
+        cmd += ["--resume", fork, "--fork-session"]
+    if a.model:
+        cmd += ["--model", a.model]
+    if a.permission_mode:
+        cmd += ["--permission-mode", a.permission_mode]
+    cmd += a.extra
+    t0 = time.time()
+    r = subprocess.run(cmd, env=child_env(account(acct)), cwd=cwd, capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    try:
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        d = {"is_error": True, "result": (r.stderr or r.stdout).strip()[-800:]}
+    return {"task": task, "account": acct, "session_id": d.get("session_id"),
+            "ok": not d.get("is_error"), "result": d.get("result", ""),
+            "cost_usd": d.get("total_cost_usd"), "seconds": round(time.time() - t0)}
+
+
+def cmd_delegate(a):
+    tasks = list(a.task)
+    if not tasks:
+        die('give at least one task: relay delegate "do X" ["do Y" …]')
+    fork = None if a.fresh else (a.fork or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    cwd = os.getcwd()
+    if fork:
+        path = find_session(fork)
+        if not path:
+            die(f'no session "{fork}" to fork. Use --fresh to start workers without context.')
+        fork = path.stem
+        meta = session_meta(path)
+        if meta["cwd"] and os.path.isdir(meta["cwd"]):
+            cwd = meta["cwd"]   # resume only finds a session from its own project
+
+    sts = statuses()
+    if a.account:
+        order = [a.account]
+    else:
+        # The account running this chat is the one under pressure; use it last.
+        here = os.environ.get("RELAY_ACCOUNT")
+        order = ranked(sts, exclude={here}) or ranked(sts)
+    if not order:
+        reset = soonest_reset(sts)
+        die("every account is out of usage" + (f"; the first frees up {until(reset)}." if reset else "."))
+    plan = [(t, order[i % len(order)]) for i, t in enumerate(tasks)]
+    for i, (t, acct) in enumerate(plan, 1):
+        say(f'worker {i} → "{acct}" ({describe(sts.get(acct))}){" with this chat as context" if fork else ""}: {t[:70]}')
+
+    def go(item):
+        t, acct = item
+        res = run_worker(t, acct, fork, cwd, a)
+        if not res["ok"] and re.search(r"limit|429", res["result"] or "", re.I):
+            spare = [n for n in ranked(statuses(max_age=0)) if n != acct]
+            if spare:
+                say(f'"{acct}" ran out mid-task; retrying on "{spare[0]}"')
+                res = run_worker(t, spare[0], fork, cwd, a)
+        return res
+
+    with ThreadPoolExecutor(max_workers=min(len(plan), a.parallel)) as pool:
+        results = list(pool.map(go, plan))
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_json(HOME / "jobs" / f"{stamp}.json", {"fork": fork, "cwd": cwd, "results": results})
+    if a.json:
+        print(json.dumps(results, indent=2))
+        return 0 if all(r["ok"] for r in results) else 1
+    for i, r in enumerate(results, 1):
+        state = "done" if r["ok"] else "FAILED"
+        print(f"\n── worker {i} · {r['account']} · {state} · {r['seconds']}s ──")
+        print((r["result"] or "").strip())
+        if r["session_id"]:
+            print(f"(follow up: relay resume {r['session_id']})")
+    return 0 if all(r["ok"] for r in results) else 1
+
+
+def cmd_install_skill(a):
+    src = Path(SELF).parent / "skill" / "SKILL.md"
+    if not src.exists():
+        die(f"can't find {src}")
+    dst = CLAUDE_DIR / "skills" / "relay" / "SKILL.md"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    print(f"relay: installed the /relay skill at {dst}")
+
+
+def cmd_launch(argv):
+    """`relay [--as NAME] [claude args…]`: claude on the best account."""
+    want = None
+    if "--as" in argv:
+        i = argv.index("--as")
+        if i + 1 >= len(argv):
+            die("--as needs an account name")
+        want = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    name = start_account(want)
+    return Runner(name, argv).run()
+
+
+COMMANDS = {"add", "rm", "list", "status", "pick", "sessions", "resume", "swap",
+            "delegate", "install-skill", "help", "_hook"}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("--version", "-V"):
+        print(f"relay {VERSION}")
+        return 0
+    if argv and argv[0] in ("-h", "--help"):
+        argv = ["help"]
+    if not argv or argv[0] not in COMMANDS:
+        return cmd_launch(argv)
+    if argv[0] == "_hook":
+        return hook_main()
+
+    ap = argparse.ArgumentParser(prog="relay", description="Run one Claude Code conversation across several Claude accounts.")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("add", help="log in an account")
+    p.add_argument("name")
+    p.add_argument("--login", action="store_true", help="use whatever `claude` is already logged into")
+    p.add_argument("--token-stdin", action="store_true", help="read a setup-token from stdin")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("rm", help="forget an account")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_rm)
+
+    sub.add_parser("list", help="list accounts").set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("status", help="usage left on every account")
+    p.add_argument("--refresh", action="store_true", help="re-check every account now")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_status)
+
+    sub.add_parser("pick", help="print the account with the most headroom").set_defaults(fn=cmd_pick)
+
+    p = sub.add_parser("sessions", help="recent conversations on this machine")
+    p.add_argument("-n", type=int, default=10)
+    p.set_defaults(fn=cmd_sessions)
+
+    p = sub.add_parser("resume", help="continue a conversation on the account with most headroom")
+    p.add_argument("session", nargs="?", help="session id (or prefix); omit to choose")
+    p.add_argument("--last", action="store_true", help="the most recently active conversation")
+    p.add_argument("--as", dest="account", help="use this account")
+    p.add_argument("-p", "--prompt", help="message to send on resume")
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("swap", help="move the running conversation to another account")
+    p.add_argument("account", nargs="?")
+    p.set_defaults(fn=cmd_swap)
+
+    p = sub.add_parser("delegate", help="run tasks as workers on other accounts")
+    p.add_argument("task", nargs="*")
+    p.add_argument("--fork", metavar="SESSION", help="session to fork (default: the one you're in)")
+    p.add_argument("--fresh", action="store_true", help="start workers with no context")
+    p.add_argument("--as", dest="account", help="put every worker on this account")
+    p.add_argument("--model")
+    p.add_argument("--permission-mode", default=os.environ.get("RELAY_PERMISSION_MODE"),
+                   help="worker permission mode (default: your usual claude default)")
+    p.add_argument("--parallel", type=int, default=4)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_delegate, extra=[])
+
+    sub.add_parser("install-skill", help="teach Claude to use relay (/relay skill)").set_defaults(fn=cmd_install_skill)
+    sub.add_parser("help").set_defaults(fn=lambda a: ap.print_help())
+
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    if hasattr(a, "extra"):
+        a.extra = extra
+    return a.fn(a) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
